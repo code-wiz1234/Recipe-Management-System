@@ -1,0 +1,494 @@
+
+
+/*==========================================================================
+ * INCLUDES
+ *==========================================================================*/
+#include <crt.h>
+#include <graph.h>
+#include <conio.h>
+#include <stdio.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <mdi.h>
+#include <fwindow.h>
+#include <data.h>
+#include <bios.h>
+#include <time.h>
+#include <oscall.h>
+#include <string.h>
+#include <math.h>
+
+/*==========================================================================
+ * CONSTANTS & MACROS
+ *==========================================================================*/
+#define FLAG_ON     1
+#define FLAG_OFF    0
+#define FONT_X      8           /* Character width in pixels */
+#define FONT_Y      16          /* Character height in pixels */
+#define MAX_RECIPES 10          /* Maximum number of recipes */
+#define PARAMS_PER_RECIPE 10    /* Parameters per recipe */
+#define BASE_MACRO_VAR 500      /* Starting macro variable number */
+#define RETRIEVE_MACRO_VAR 600  /* Macro vars for retrieved recipe */
+
+/* Text color escape sequence */
+#define STRCOL(x)   printf("\033[3%dm", x)
+/* Cursor positioning escape sequence */
+#define LOCATE(y,x) printf("\033[%d;%dH", y, x)
+
+/*==========================================================================
+ * TYPE DEFINITIONS
+ *==========================================================================*/
+/* Structure for soft-key button display properties */
+typedef struct {
+    int x;          /* X position (character units) */
+    int y;          /* Y position (character units) */
+    int w;          /* Width (character units) */
+    int h;          /* Height (character units) */
+    char name[80];  /* Button label text */
+} DISPCNTL;
+
+/*==========================================================================
+ * GLOBAL VARIABLES
+ *==========================================================================*/
+static unsigned int redraw_flag = 0;    /* Screen redraw flag */
+short x1, y1, x2, y2;                   /* Rectangle coordinates */
+char recipe_number[10];                 /* Current recipe number string */
+int parameters[PARAMS_PER_RECIPE];      /* Recipe parameter values */
+
+/* Soft-key button configuration (12 buttons: FL, F1-F10, FR) */
+DISPCNTL DispCntlSkey[12] = {
+    { 2, 27, 3, 3, " < \0 "},      /* [FL] - Left scroll */
+    { 6, 27, 6, 3, " Create "},    /* [F1] - Create new recipe */
+    {13, 27, 6, 3, " Save "},      /* [F2] - Save recipe */
+    {20, 27, 6, 3, " Retrieve"},   /* [F3] - Retrieve recipe */
+    {27, 27, 6, 3, " F4\0"},       /* [F4] - Unused */
+    {34, 27, 6, 3, " F5\0"},       /* [F5] - Unused */
+    {42, 27, 6, 3, " F6\0"},       /* [F6] - Unused */
+    {49, 27, 6, 3, " F7 \0"},      /* [F7] - Unused */
+    {56, 27, 6, 3, " F8 \0"},      /* [F8] - Unused */
+    {63, 27, 6, 3, " F9 \0"},      /* [F9] - Unused */
+    {70, 27, 6, 3, " F10 \0"},     /* [F10] - Unused */
+    {77, 27, 3, 3, " > \0 "},      /* [FR] - Right scroll */
+};
+
+/* VGA 16-color palette configuration */
+long palindex_tbl[16] = {
+    0,              /* 0  - Black */
+    _BLUE,          /* 1  - Blue */
+    _GREEN,         /* 2  - Green */
+    _CYAN,          /* 3  - Cyan */
+    _RED,           /* 4  - Red */
+    _MAGENTA,       /* 5  - Magenta */
+    _YELLOW,        /* 6  - Yellow */
+    _WHITE,         /* 7  - White */
+    _GRAY,          /* 8  - Gray */
+    _LIGHTBLUE,     /* 9  - Light Blue */
+    _LIGHTGREEN,    /* 10 - Light Green */
+    _LIGHTCYAN,     /* 11 - Light Cyan */
+    _LIGHTRED,      /* 12 - Light Red */
+    _LIGHTMAGENTA,  /* 13 - Light Magenta */
+    _BLACK,         /* 14 - Black (duplicate) */
+    _98DARKRED,     /* 15 - Dark Red */
+};
+
+/*==========================================================================
+ * FUNCTION PROTOTYPES
+ *==========================================================================*/
+static void initialize(void);
+static void get_keyin(void);
+static void esc_cls(void);
+static void RefreshScreen(void);
+static void handle_create(void);
+static void handle_save(const char* recipe_number, int* parameters);
+static void handle_retrieve(void);
+static void draw_header(void);
+static void draw_box(void);
+void display_buttons(void);
+int crt_isnew(void);
+short write_macro(short number, long value, short dec);
+short read_macro(short number);
+
+/*==========================================================================
+ * MAIN FUNCTION
+ *==========================================================================*/
+/**
+ * Main entry point - initializes display and runs the main event loop
+ */
+int main(void) {
+    int old_scr = -1;
+    int cur_scr = -1;
+
+    /* Initialize graphics and display */
+    initialize();
+    display_buttons();
+    draw_box();
+    draw_header();
+
+    /* Main event loop */
+    for (;;) {
+        cur_scr = crt_getcurscrn();
+        
+        /* Check if screen needs redrawing */
+        if (crt_isnewscrn() || (cur_scr != old_scr)) {
+            old_scr = cur_scr;
+            redraw_flag = FLAG_ON;
+        }
+        
+        /* Process keyboard input */
+        get_keyin();
+    }
+
+    return 0;
+}
+
+/*==========================================================================
+ * INITIALIZATION FUNCTIONS
+ *==========================================================================*/
+/**
+ * Initialize CRT display, graphics mode, and color palette
+ */
+static void initialize(void) {
+    static int crt_table[] = { CRT_CUS_CEXE };
+    short ret;
+    unsigned int save_mode;
+
+    /* Register user screen */
+    crt_setuserscrn(scrn_tbl_size(crt_table), crt_table);
+    
+    /* Open graphics mode */
+    ret = crt_opengr();
+    save_mode = crt_setswt(CRT_SWT_GREN);
+
+    /* Set video mode: 640x480, 16 colors */
+    _setvideomode(_VRES16COLOR);
+    
+    /* Set CRT type */
+    crt_setmode(CRT_MODE_V30);
+    crt_graphic(CRT_ON_BEAM);
+    
+    /* Configure color palette */
+    crt_setallpalette((unsigned long *)palindex_tbl);
+    _remapallpalette(palindex_tbl);
+    crt_setpalette(_PAL_COMP, CRT_PAL_CHAR);
+
+    /* Hide cursor */
+    printf("\033[>5h");
+    
+    /* Clear screen */
+    esc_cls();
+}
+
+/**
+ * Clear entire screen using escape sequence
+ */
+static void esc_cls(void) {
+    printf("\033[2J");
+}
+
+/*==========================================================================
+ * UI DRAWING FUNCTIONS
+ *==========================================================================*/
+/**
+ * Draw the soft-key buttons at the bottom of the screen
+ */
+void display_buttons(void) {
+    short i;
+    
+    for (i = 0; i < 12; i++) {
+        /* Calculate pixel coordinates from character positions */
+        x1 = (DispCntlSkey[i].x - 1) * FONT_X;
+        y1 = (DispCntlSkey[i].y - 1) * FONT_Y;
+        x2 = (DispCntlSkey[i].x + DispCntlSkey[i].w - 1) * FONT_X;
+        y2 = (DispCntlSkey[i].y + DispCntlSkey[i].h - 1) * FONT_Y;
+
+        /* Draw button background with border */
+        _setcolor(15);
+        _rectangle(_GFILLINTERIOR, x1 - 3, y1 - 3, x2 + 3, y2 + 3);
+        _rectangle(_GBORDER, x1 - 3, y1 - 3, x2 + 3, y2 + 3);
+        _rectangle(_GFILLINTERIOR, x1, y1, x2, y2);
+
+        /* Draw button label */
+        STRCOL(7);
+        LOCATE(DispCntlSkey[i].y + 1, DispCntlSkey[i].x);
+        printf("%s", DispCntlSkey[i].name);
+    }
+}
+
+/**
+ * Draw the header bar with title
+ */
+void draw_header(void) {
+    _setcolor(15);
+    _rectangle(_GFILLINTERIOR, 0, 0, 640, 50);
+    
+    STRCOL(7);
+    LOCATE(2, 30);
+    printf("RECIPE MANAGEMENT PROJECT");
+}
+
+/**
+ * Draw the main content box
+ */
+void draw_box(void) {
+    int margin = 5;
+    int button_height = 70;
+    int box_x1, box_y1, box_x2, box_y2;
+
+    /* Calculate box dimensions */
+    box_x1 = margin;
+    box_y1 = 50 + margin;
+    box_x2 = 640 - margin;
+    box_y2 = 480 - button_height - margin;
+
+    /* Draw filled box with border */
+    _setcolor(8);
+    _rectangle(_GFILLINTERIOR, box_x1, box_y1, box_x2, box_y2);
+    _setcolor(14);
+    _rectangle(_GBORDER, box_x1, box_y1, box_x2, box_y2);
+}
+
+/**
+ * Refresh screen after mode change
+ */
+static void RefreshScreen(void) {
+    unsigned int save_mode;
+    int ret;
+
+    esc_cls();
+
+    /* Re-initialize graphics */
+    ret = crt_opengr();
+    save_mode = crt_setswt(CRT_SWT_GREN);
+
+    if (ret == -1) return;
+    if (ret) _setvideomode(_VRES16COLOR);
+
+    crt_graphic(CRT_ON_BEAM);
+    crt_setallpalette((unsigned long *)palindex_tbl);
+    _remapallpalette(palindex_tbl);
+    crt_setpalette(_PAL_COMP, CRT_PAL_CHAR);
+
+    display_buttons();
+}
+
+/*==========================================================================
+ * INPUT HANDLING
+ *==========================================================================*/
+/**
+ * Process keyboard input and dispatch to appropriate handler
+ */
+static void get_keyin(void) {
+    int key = 0;
+
+    if (kbhit()) {
+        key = getch();
+    }
+
+    switch (key) {
+        case MDIKEY_14_F0:  /* Create button */
+            handle_create();
+            break;
+        case MDIKEY_14_F1:  /* Save button */
+            handle_save(recipe_number, parameters);
+            break;
+        case MDIKEY_14_F2:  /* Retrieve button */
+            handle_retrieve();
+            break;
+        default:
+            break;
+    }
+}
+
+/*==========================================================================
+ * CNC MACRO VARIABLE FUNCTIONS
+ *==========================================================================*/
+/**
+ * Write a value to a CNC macro variable
+ * 
+ * @param number  Macro variable number (e.g., 500-609)
+ * @param value   Value to write (scaled by decimal places)
+ * @param dec     Number of decimal places
+ * @return        Error code (EW_OK on success)
+ */
+short write_macro(short number, long value, short dec) {
+    short ret;
+    short length = 10;
+    ret = cnc_wrmacro(number, length, value, dec);
+    return ret;
+}
+
+/**
+ * Read a value from a CNC macro variable
+ * 
+ * @param number  Macro variable number to read
+ * @return        Error code (EW_OK on success)
+ */
+short read_macro(short number) {
+    struct odbm buf;
+    short ret;
+    ret = cnc_rdmacro(number, 10, &buf);
+    return ret;
+}
+
+/*==========================================================================
+ * RECIPE MANAGEMENT FUNCTIONS
+ *==========================================================================*/
+/**
+ * Handle CREATE button press
+ * Prompts user to enter recipe number and 10 parameter values
+ */
+void handle_create(void) {
+    int i;
+
+    /* Prompt for recipe number */
+    STRCOL(6);
+    LOCATE(5, 4);
+    printf("Enter Recipe Number (1-10): ");
+    scanf("%9s", recipe_number);
+
+    /* Prompt for each parameter */
+    for (i = 0; i < PARAMS_PER_RECIPE; i++) {
+        LOCATE(7 + i * 2, 6);
+        STRCOL(7);
+        printf("Parameter %d: ", i + 1);
+        scanf("%d", &parameters[i]);
+    }
+
+    /* Confirmation message */
+    LOCATE(25, 30);
+    STRCOL(7);
+    printf("Parameters for recipe %s entered.\n", recipe_number);
+    
+    display_buttons();
+}
+
+/**
+ * Handle SAVE button press
+ * Saves the current parameters to the appropriate macro variable range
+ * 
+ * @param recipe_number  String containing recipe number (1-10)
+ * @param parameters     Array of 10 parameter values to save
+ */
+void handle_save(const char* recipe_number, int* parameters) {
+    short result;
+    short dec;
+    long value;
+    int i;
+    int start_macrovar;
+    int recipe_num;
+
+    /* Calculate starting macro variable based on recipe number */
+    recipe_num = atoi(recipe_number);
+    
+    if (recipe_num >= 1 && recipe_num <= MAX_RECIPES) {
+        /* Recipe 1 -> 500, Recipe 2 -> 510, etc. */
+        start_macrovar = BASE_MACRO_VAR + (recipe_num - 1) * PARAMS_PER_RECIPE;
+    } else {
+        LOCATE(10, 10);
+        STRCOL(15);
+        printf("Invalid recipe number: %d (must be 1-10)", recipe_num);
+        return;
+    }
+
+    /* Write each parameter to its macro variable */
+    for (i = 0; i < PARAMS_PER_RECIPE; i++) {
+        value = parameters[i];
+        dec = 0;
+
+        /* Handle decimal values */
+        if (value != (long)value) {
+            double intpart, fractpart;
+            fractpart = modf(value, &intpart);
+            dec = (short)(fractpart * 1000000000);
+        }
+
+        result = write_macro(start_macrovar + i, value, 0);
+        
+        if (result == EW_OK) {
+            LOCATE(12, 26);
+            STRCOL(3);
+            printf("Successfully saved to macro vars %d-%d\n", 
+                   start_macrovar, start_macrovar + 9);
+        } else {
+            printf("Error saving parameter %d: code %d\n", i + 1, result);
+        }
+    }
+
+    esc_cls();
+    display_buttons();
+}
+
+/**
+ * Handle RETRIEVE button press
+ * Reads parameters from specified recipe and copies to active range (600-609)
+ */
+void handle_retrieve(void) {
+    int start_macrovar;
+    int start_macrovar_dest = RETRIEVE_MACRO_VAR;
+    short result;
+    struct odbm buffer;
+    double og_value;
+    int recipe_num;
+    int i;
+
+    /* Prompt for recipe number to retrieve */
+    LOCATE(5, 4);
+    STRCOL(6);
+    printf("Enter recipe number to retrieve (1-10): ");
+    scanf("%s", recipe_number);
+
+    /* Validate and calculate source macro variable range */
+    recipe_num = atoi(recipe_number);
+    
+    if (recipe_num >= 1 && recipe_num <= MAX_RECIPES) {
+        start_macrovar = BASE_MACRO_VAR + (recipe_num - 1) * PARAMS_PER_RECIPE;
+    } else {
+        LOCATE(10, 10);
+        STRCOL(15);
+        printf("Invalid recipe number: %d", recipe_num);
+        return;
+    }
+
+    /* Read each parameter and copy to destination range */
+    for (i = 0; i < PARAMS_PER_RECIPE; i++) {
+        result = cnc_rdmacro(start_macrovar + i, 10, &buffer);
+        
+        if (!result) {
+            /* Calculate original value from stored format */
+            og_value = (double)buffer.mcr_val / pow(10, buffer.dec_val);
+            
+            /* Display retrieved value */
+            LOCATE(7 + i * 2, 6);
+            STRCOL(7);
+            printf("Parameter %d: %.6f\n", i + 1, og_value);
+        }
+
+        if (result == EW_OK) {
+            /* Copy to destination macro variable (600-609) */
+            result = cnc_wrmacro(start_macrovar_dest + i, 10, 
+                                 buffer.mcr_val, buffer.dec_val);
+            
+            if (result == EW_OK) {
+                LOCATE(12, 28);
+                STRCOL(1);
+                printf("Retrieved recipe %d to macro vars 600-609\n", recipe_num);
+            } else {
+                printf("Error writing to macro %d: %d\n", 
+                       start_macrovar_dest + i, result);
+            }
+        } else {
+            printf("Error reading macro %d: %d\n", start_macrovar + i, result);
+        }
+    }
+
+    esc_cls();
+    display_buttons();
+}
+
+/**
+ * Utility function to check for new screen
+ */
+int crt_isnew(void) {
+    return 1;
+}
+
